@@ -20,6 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
 import traceback
+import uuid  # For X-TT-LOGID header
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -39,6 +40,10 @@ REPLICATE_API_TOKEN = st.secrets["REPLICATE_API_TOKEN"]
 replicate.api_token = REPLICATE_API_TOKEN
 
 API_URL = "https://ark.ap-southeast.bytepluses.com/api/v3/images/generations"
+MODEL_NAME = "seedream-4-0-250828"  # Seedream 4.0 model
+
+# Image quality settings
+OUTPUT_SIZE = "2304x4096"  # 4K resolution
 
 # Parallel processing configuration
 MAX_WORKERS_PROMPTS = 5  # For GPT-5 prompt generation
@@ -159,7 +164,7 @@ class PromptVariantGenerator:
 
 
 class SeedreamImageGenerator:
-    """Handles Seedream image generation with face-swap"""
+    """Handles Seedream image generation with face-swap using Ark API"""
     
     def __init__(self):
         self.local = threading.local()
@@ -181,8 +186,6 @@ class SeedreamImageGenerator:
             session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
             
             session.headers.update({
-                "Authorization": f"Bearer {ARK_API_KEY}",
-                "Content-Type": "application/json",
                 "User-Agent": "SeedrameImageGenerator/1.0",
                 "Accept": "application/json",
                 "Connection": "keep-alive"
@@ -204,22 +207,26 @@ class SeedreamImageGenerator:
             return None
     
     def generate_image_with_faceswap(self, prompt, selfie_base64, max_retries=3):
-        """Generate image using Seedream with face-swap"""
+        """Generate image using Seedream with face-swap using Ark API v3"""
         
         session = self.get_session()
         
+        # Prepare payload matching Ark API v3 format
         payload = {
-            "req_key": "seedream_v5.1_xl_ar1_ip_cnet_tile_cfg4",
+            "model": MODEL_NAME,
             "prompt": prompt,
-            "num_images": 1,
-            "enable_sr": False,
-            "scale": 4,
-            "seed": -1,
-            "ref_images": [selfie_base64],
-            "cnet_preprocess": [{
-                "type": "InstantID",
-                "image": selfie_base64
-            }]
+            "image": [selfie_base64],
+            "response_format": "url",
+            "size": OUTPUT_SIZE,
+            "watermark": False,
+            "stream": False
+        }
+        
+        # Headers matching Ark API requirements
+        headers = {
+            "X-TT-LOGID": str(uuid.uuid4()),
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ARK_API_KEY}"
         }
         
         for attempt in range(max_retries):
@@ -228,6 +235,7 @@ class SeedreamImageGenerator:
                 
                 response = session.post(
                     API_URL,
+                    headers=headers,
                     json=payload,
                     timeout=120,
                     verify=False
@@ -236,29 +244,35 @@ class SeedreamImageGenerator:
                 if response.status_code == 200:
                     result = response.json()
                     
-                    if result.get("data", {}).get("status") == "succeed":
-                        images = result["data"].get("images", [])
-                        if images and len(images) > 0:
-                            image_url = images[0].get("url")
+                    # Parse response matching Ark API v3 format
+                    if 'data' in result and isinstance(result['data'], list) and len(result['data']) > 0:
+                        image_data = result['data'][0]
+                        image_url = image_data.get('url')
+                        
+                        if image_url:
+                            logger.debug(f"Got image URL: {image_url[:50]}...")
                             
-                            if image_url:
-                                # Download the image
-                                image_response = session.get(
-                                    image_url,
-                                    timeout=60,
-                                    verify=False
-                                )
-                                
-                                if image_response.status_code == 200:
-                                    logger.info("Successfully generated and downloaded image")
-                                    return image_response.content
-                                else:
-                                    logger.error(f"Failed to download image: {image_response.status_code}")
+                            # Download the image
+                            image_response = session.get(
+                                image_url,
+                                timeout=60,
+                                verify=False
+                            )
+                            
+                            if image_response.status_code == 200:
+                                logger.info("Successfully generated and downloaded image")
+                                return image_response.content
+                            else:
+                                logger.error(f"Failed to download image: {image_response.status_code}")
+                        else:
+                            logger.error(f"No URL in response: {result}")
+                    else:
+                        logger.error(f"Unexpected response format: {result}")
                     
                     logger.warning(f"Generation failed or no images returned")
                 
                 else:
-                    logger.error(f"API request failed with status {response.status_code}")
+                    logger.error(f"API request failed with status {response.status_code}: {response.text[:200]}")
                 
                 # Retry logic
                 if attempt < max_retries - 1:
@@ -323,16 +337,16 @@ def create_download_package(image_results, metadata_df):
     zip_buffer = BytesIO()
     
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # Add metadata CSV
+        csv_buffer = BytesIO()
+        metadata_df.to_csv(csv_buffer, index=False)
+        zip_file.writestr('metadata.csv', csv_buffer.getvalue())
+        
         # Add images
         for prompt_idx, variant_idx, variant_prompt, base_prompt, image_bytes, success in image_results:
             if success and image_bytes:
                 filename = f"prompt_{prompt_idx + 1:03d}_variant_{variant_idx + 1}.jpg"
-                zip_file.writestr(f"images/{filename}", image_bytes)
-        
-        # Add metadata CSV
-        csv_buffer = BytesIO()
-        metadata_df.to_csv(csv_buffer, index=False)
-        zip_file.writestr("metadata.csv", csv_buffer.getvalue())
+                zip_file.writestr(filename, image_bytes)
     
     zip_buffer.seek(0)
     return zip_buffer
@@ -340,43 +354,42 @@ def create_download_package(image_results, metadata_df):
 
 def main():
     st.set_page_config(
-        page_title="Prompt Variant Generator with Face Swap",
+        page_title="Prompt Variant Generator",
         page_icon="🎨",
         layout="wide"
     )
     
-    st.title("🎨 Prompt Variant Generator with Face Swap")
-    st.markdown("""
-    This tool generates 4 image variants for each prompt using:
-    1. **GPT-5** via Replicate for prompt variation
-    2. **Seedream** for image generation with face-swap
-    """)
+    st.title("🎨 Prompt Variant Image Generator")
+    st.markdown("Generate multiple image variants from base prompts using GPT-5 and Seedream")
     
-    # Sidebar configuration
-    st.sidebar.header("⚙️ Configuration")
-    max_workers_prompts = st.sidebar.slider(
-        "Parallel Prompt Generation Workers",
-        min_value=1,
-        max_value=10,
-        value=MAX_WORKERS_PROMPTS,
-        help="Number of parallel threads for GPT-5 prompt generation"
-    )
+    # Sidebar for configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        max_workers_prompts = st.slider(
+            "Prompt Workers",
+            min_value=1,
+            max_value=10,
+            value=MAX_WORKERS_PROMPTS,
+            help="Number of parallel workers for prompt generation"
+        )
+        max_workers_images = st.slider(
+            "Image Workers",
+            min_value=1,
+            max_value=20,
+            value=MAX_WORKERS_IMAGES,
+            help="Number of parallel workers for image generation"
+        )
+        
+        st.markdown("---")
+        st.markdown("""
+        ### How it works:
+        1. **Upload CSV**: with `prompt` and `gender` columns
+        2. **Upload Selfie**: face to use for all images
+        3. **Generate**: Creates 4 variants per prompt
+        4. **Download**: Get ZIP with images + metadata
+        """)
     
-    max_workers_images = st.sidebar.slider(
-        "Parallel Image Generation Workers",
-        min_value=1,
-        max_value=20,
-        value=MAX_WORKERS_IMAGES,
-        help="Number of parallel threads for Seedream image generation"
-    )
-    
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 📋 CSV Format Required")
-    st.sidebar.code("""prompt,gender
-A woman in Tokyo street,female
-A man in coffee shop,male""")
-    
-    # File uploads
+    # Main content
     col1, col2 = st.columns(2)
     
     with col1:
@@ -384,7 +397,7 @@ A man in coffee shop,male""")
         csv_file = st.file_uploader(
             "Choose CSV file",
             type=['csv'],
-            help="CSV with 'prompt' and 'gender' columns"
+            help="CSV must have 'prompt' and 'gender' columns"
         )
         
         if csv_file:
